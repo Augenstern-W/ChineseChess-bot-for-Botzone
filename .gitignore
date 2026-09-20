@@ -1,0 +1,21 @@
+# ============================================
+# ChineseChess .gitignore
+# ============================================
+
+# ---- 编译产物（可由 build.bat 重新生成） ----
+bin/
+*.exe
+*.o
+*.obj
+*.gch
+*.pdb
+
+# ---- 内嵌 MinGW 工具链（数百 MB，请自行下载安装） ----
+tools/mingw64/
+tools/winlibs.zip
+*.zip
+
+# ---- 系统临时文件 ----
+Thumbs.db
+Desktop.ini
+*.tmp

@@ -1,0 +1,1511 @@
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <string>
+#include <utility>
+#include <vector>
+#include "jsoncpp/json.h"
+
+using std::cin;
+using std::cout;
+using std::string;
+using std::vector;
+
+#define BOARDWIDTH 9
+#define BOARDHEIGHT 10
+
+enum stoneType { None = 0, King = 1, Bishop = 2, Knight = 3, Rook = 4, Pawn = 5, Cannon = 6, Assistant = 7 };
+enum colorType { BLACK = 0, RED = 1, EMPTY = 2 };
+
+static const int dx_ob[4] = { -1, 1, -1, 1 };
+static const int dy_ob[4] = { -1, -1, 1, 1 };
+static const int dx_strai[4] = { -1, 0, 0, 1 };
+static const int dy_strai[4] = { 0, -1, 1, 0 };
+static const int dx_lr[2] = { -1, 1 };
+static const int dx_knight[8] = { -2, -2, -1, -1, 1, 1, 2, 2 };
+static const int dy_knight[8] = { -1, 1, -2, 2, -2, 2, -1, 1 };
+static const int dx_knight_foot[8] = { -1, -1, 0, 0, 0, 0, 1, 1 };
+static const int dy_knight_foot[8] = { 0, 0, -1, 1, -1, 1, 0, 0 };
+static const int dx_bishop[4] = { -2, -2, 2, 2 };
+static const int dy_bishop[4] = { -2, 2, -2, 2 };
+static const int dx_bishop_eye[4] = { -1, -1, 1, 1 };
+static const int dy_bishop_eye[4] = { -1, 1, -1, 1 };
+
+int pgnchar2int(char c) {
+    return static_cast<int>(c) - static_cast<int>('a');
+}
+
+char pgnint2char(int i) {
+    return static_cast<char>(static_cast<int>('a') + i);
+}
+
+int char2int(char c) {
+    return static_cast<int>(c) - static_cast<int>('0');
+}
+
+char int2char(int i) {
+    return static_cast<char>(static_cast<int>('0') + i);
+}
+
+struct Move {
+    int source_x, source_y, target_x, target_y;
+    Move() : source_x(-1), source_y(-1), target_x(-1), target_y(-1) {}
+    Move(int msx, int msy, int mtx, int mty)
+        : source_x(msx), source_y(msy), target_x(mtx), target_y(mty) {
+    }
+    Move(const string& msource, const string& mtarget)
+        : source_x(-1), source_y(-1), target_x(-1), target_y(-1) {
+        if (msource.size() >= 2 && mtarget.size() >= 2 && msource[0] >= 'a' && msource[0] <= 'i' &&
+            msource[1] >= '0' && msource[1] <= '9' && mtarget[0] >= 'a' && mtarget[0] <= 'i' &&
+            mtarget[1] >= '0' && mtarget[1] <= '9') {
+            source_x = pgnchar2int(msource[0]);
+            source_y = char2int(msource[1]);
+            target_x = pgnchar2int(mtarget[0]);
+            target_y = char2int(mtarget[1]);
+        }
+    }
+    bool operator==(const Move& other) const {
+        return source_x == other.source_x && source_y == other.source_y &&
+            target_x == other.target_x && target_y == other.target_y;
+    }
+    bool operator!=(const Move& other) const {
+        return !(*this == other);
+    }
+};
+
+struct Grid {
+    stoneType type;
+    colorType color;
+    Grid() : type(None), color(EMPTY) {}
+    Grid(stoneType mtype, colorType mcolor) : type(mtype), color(mcolor) {}
+    bool operator==(const Grid& other) const {
+        return type == other.type && color == other.color;
+    }
+};
+
+namespace {
+
+    const int INF_SCORE = 1000000000;
+    const int MATE_SCORE = 10000000;
+    const int MAX_SEARCH_PLY = 128;
+    const int TT_EXACT = 0;
+    const int TT_LOWER = 1;
+    const int TT_UPPER = 2;
+    const int DEFAULT_TIME_MS = 800;
+    const int PEACE_LIMIT = 59;
+    const int MAX_CONSECUTIVE_QUIET_CHECKS = 2;
+
+    uint64_t ZOBRIST[2][8][BOARDWIDTH * BOARDHEIGHT];
+    uint64_t ZOBRIST_SIDE = 0;
+    uint64_t ZOBRIST_PEACE[64];
+    bool ZOBRIST_READY = false;
+    int GLOBAL_TIME_LIMIT_MS = DEFAULT_TIME_MS;
+
+    uint64_t splitMix64(uint64_t& x) {
+        x += 0x9e3779b97f4a7c15ULL;
+        uint64_t z = x;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        return z ^ (z >> 31);
+    }
+
+    void initZobrist() {
+        if (ZOBRIST_READY) return;
+        uint64_t seed = 202605130971ULL;
+        for (int c = 0; c < 2; ++c) {
+            for (int t = 0; t < 8; ++t) {
+                for (int p = 0; p < BOARDWIDTH * BOARDHEIGHT; ++p) {
+                    ZOBRIST[c][t][p] = splitMix64(seed);
+                }
+            }
+        }
+        ZOBRIST_SIDE = splitMix64(seed);
+        for (int i = 0; i < 64; ++i) {
+            ZOBRIST_PEACE[i] = splitMix64(seed);
+        }
+        ZOBRIST_READY = true;
+    }
+
+    int colorIndex(colorType color) {
+        return color == RED ? 1 : 0;
+    }
+
+    colorType oppositeColor(colorType color) {
+        return color == RED ? BLACK : RED;
+    }
+
+    bool validMoveObject(const Move& move) {
+        return move.source_x >= 0 && move.source_x < BOARDWIDTH && move.source_y >= 0 && move.source_y < BOARDHEIGHT &&
+            move.target_x >= 0 && move.target_x < BOARDWIDTH && move.target_y >= 0 && move.target_y < BOARDHEIGHT;
+    }
+
+    int pieceValue(stoneType type) {
+        switch (type) {
+        case King: return 20000;
+        case Rook: return 1000;
+        case Cannon: return 500;
+        case Knight: return 450;
+        case Pawn: return 105;
+        case Bishop: return 125;
+        case Assistant: return 125;
+        default: return 0;
+        }
+    }
+
+    int relativeY(colorType color, int y) {
+        return color == RED ? y : (BOARDHEIGHT - 1 - y);
+    }
+
+    bool crossedRiver(colorType color, int y) {
+        return color == RED ? (y > 4) : (y < 5);
+    }
+
+    int centerScore(int x) {
+        return 4 - std::abs(x - 4);
+    }
+
+    int clampInt(int v, int lo, int hi) {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    }
+
+} // namespace
+
+class Chess {
+private:
+    std::array<Grid, BOARDWIDTH* BOARDHEIGHT> board;
+    colorType currColor;
+    int currTurnId;
+    int peaceCount;
+    int kingPos[2];
+    uint64_t boardHash;
+
+    struct UndoRecord {
+        Move move;
+        Grid moved;
+        Grid captured;
+        colorType prevColor;
+        int prevTurnId;
+        int prevPeace;
+        int prevKingPos[2];
+        uint64_t prevHash;
+    };
+
+    vector<UndoRecord> undoStack;
+    vector<uint64_t> stateKeys;
+    vector<int> lastMoveEaten;
+    vector<int> lastMoveChecked;
+
+    int quietCheckStreakForCurrentSide() const;
+
+public:
+    Chess();
+    void resetBoard();
+    void generateMoves(vector<Move>& legalMoves, bool mustDefend = true, bool capturesOnly = false);
+    void generateCaptureMoves(vector<Move>& legalMoves, bool mustDefend = true);
+    void generateMovesWithForbidden(vector<Move>& legalMoves, bool mustDefend = true);
+    bool repeatAfterMove(const Move& move);
+    static bool inBoard(int mx, int my);
+    static bool inKingArea(int mx, int my, colorType mcolor);
+    static bool inColorArea(int mx, int my, colorType mcolor);
+    colorType oppColor() const;
+    static colorType oppColor(colorType mcolor);
+    bool isMoveValid(const Move& move, bool mustDefend = true);
+    bool isLegalMove(const Move& move, bool mustDefend = true);
+    bool isLegalMoveWithForbidden(const Move& move, bool mustDefend = true);
+    bool isMoveValidWithForbidden(const Move& move, bool mustDefend = true);
+    bool makeMoveAssumeLegal(const Move& move, bool recordCheck = false);
+    bool attacked(colorType color, int mx, int my) const;
+    bool isKingAttacked(colorType side) const;
+    bool currentKingAttacked() const;
+    bool isMyKingAttackedAfterMove(const Move& move);
+    bool isOppKingAttackedAfterMove(const Move& move);
+    bool moveGivesCheck(const Move& move);
+    bool longCheckAfterMove(const Move& move);
+    bool winAfterMove(const Move& move);
+    void undoMove();
+    bool exceedMaxPeaceState() const;
+    static int xy2pos(int mx, int my);
+    static int pos2x(int mpos);
+    static int pos2y(int mpos);
+    Grid getGrid(int mx, int my) const;
+    Grid getGridAt(int pos) const;
+    colorType currentColor() const;
+    int currentTurn() const;
+    int peaceTurn() const;
+    stoneType sourceType(const Move& move) const;
+    stoneType targetType(const Move& move) const;
+    bool moveIsCapture(const Move& move) const;
+    bool hasKing(colorType mcolor) const;
+    uint64_t positionKey() const;
+    uint64_t searchKey() const;
+    void printBoard() const;
+};
+
+Chess::Chess() {
+    resetBoard();
+}
+
+void Chess::resetBoard() {
+    initZobrist();
+    for (size_t i = 0; i < board.size(); ++i) board[i] = Grid();
+    currColor = RED;
+    currTurnId = 0;
+    peaceCount = 0;
+    kingPos[0] = -1;
+    kingPos[1] = -1;
+    boardHash = 0;
+    undoStack.clear();
+    undoStack.reserve(256);
+    stateKeys.clear();
+    lastMoveEaten.clear();
+    lastMoveChecked.clear();
+
+    auto put = [&](int x, int y, stoneType type, colorType color) {
+        int pos = xy2pos(x, y);
+        board[pos] = Grid(type, color);
+        boardHash ^= ZOBRIST[colorIndex(color)][type][pos];
+        if (type == King) kingPos[colorIndex(color)] = pos;
+        };
+
+    put(0, 0, Rook, RED);      put(1, 0, Knight, RED);    put(2, 0, Bishop, RED);
+    put(3, 0, Assistant, RED); put(4, 0, King, RED);      put(5, 0, Assistant, RED);
+    put(6, 0, Bishop, RED);    put(7, 0, Knight, RED);    put(8, 0, Rook, RED);
+    put(1, 2, Cannon, RED);    put(7, 2, Cannon, RED);
+    put(0, 3, Pawn, RED);      put(2, 3, Pawn, RED);      put(4, 3, Pawn, RED);
+    put(6, 3, Pawn, RED);      put(8, 3, Pawn, RED);
+
+    put(0, 9, Rook, BLACK);      put(1, 9, Knight, BLACK);    put(2, 9, Bishop, BLACK);
+    put(3, 9, Assistant, BLACK); put(4, 9, King, BLACK);      put(5, 9, Assistant, BLACK);
+    put(6, 9, Bishop, BLACK);    put(7, 9, Knight, BLACK);    put(8, 9, Rook, BLACK);
+    put(1, 7, Cannon, BLACK);    put(7, 7, Cannon, BLACK);
+    put(0, 6, Pawn, BLACK);      put(2, 6, Pawn, BLACK);      put(4, 6, Pawn, BLACK);
+    put(6, 6, Pawn, BLACK);      put(8, 6, Pawn, BLACK);
+
+    stateKeys.push_back(boardHash);
+    lastMoveEaten.push_back(0);
+    lastMoveChecked.push_back(0);
+}
+
+bool Chess::inBoard(int mx, int my) {
+    return mx >= 0 && mx < BOARDWIDTH && my >= 0 && my < BOARDHEIGHT;
+}
+
+bool Chess::inKingArea(int mx, int my, colorType mcolor) {
+    if (mcolor == RED) return mx >= 3 && mx <= 5 && my >= 0 && my <= 2;
+    if (mcolor == BLACK) return mx >= 3 && mx <= 5 && my >= 7 && my <= 9;
+    return false;
+}
+
+bool Chess::inColorArea(int mx, int my, colorType mcolor) {
+    (void)mx;
+    if (mcolor == RED) return my <= 4;
+    if (mcolor == BLACK) return my >= 5;
+    return false;
+}
+
+colorType Chess::oppColor() const {
+    return currColor == RED ? BLACK : RED;
+}
+
+colorType Chess::oppColor(colorType mcolor) {
+    return mcolor == RED ? BLACK : RED;
+}
+
+int Chess::xy2pos(int mx, int my) {
+    return my * BOARDWIDTH + mx;
+}
+
+int Chess::pos2x(int mpos) {
+    return mpos % BOARDWIDTH;
+}
+
+int Chess::pos2y(int mpos) {
+    return mpos / BOARDWIDTH;
+}
+
+Grid Chess::getGrid(int mx, int my) const {
+    if (!inBoard(mx, my)) return Grid();
+    return board[xy2pos(mx, my)];
+}
+
+Grid Chess::getGridAt(int pos) const {
+    if (pos < 0 || pos >= BOARDWIDTH * BOARDHEIGHT) return Grid();
+    return board[pos];
+}
+
+colorType Chess::currentColor() const {
+    return currColor;
+}
+
+int Chess::currentTurn() const {
+    return currTurnId;
+}
+
+int Chess::peaceTurn() const {
+    return peaceCount;
+}
+
+uint64_t Chess::positionKey() const {
+    return boardHash;
+}
+
+uint64_t Chess::searchKey() const {
+    uint64_t key = boardHash;
+    if (currColor == BLACK) key ^= ZOBRIST_SIDE;
+    key ^= ZOBRIST_PEACE[clampInt(peaceCount, 0, 63)];
+    return key;
+}
+
+stoneType Chess::sourceType(const Move& move) const {
+    if (!inBoard(move.source_x, move.source_y)) return None;
+    return board[xy2pos(move.source_x, move.source_y)].type;
+}
+
+stoneType Chess::targetType(const Move& move) const {
+    if (!inBoard(move.target_x, move.target_y)) return None;
+    return board[xy2pos(move.target_x, move.target_y)].type;
+}
+
+bool Chess::moveIsCapture(const Move& move) const {
+    if (!inBoard(move.target_x, move.target_y)) return false;
+    const Grid& target = board[xy2pos(move.target_x, move.target_y)];
+    return target.color != EMPTY && target.color != currColor;
+}
+
+bool Chess::hasKing(colorType mcolor) const {
+    int pos = kingPos[colorIndex(mcolor)];
+    return pos >= 0 && pos < BOARDWIDTH * BOARDHEIGHT && board[pos].type == King && board[pos].color == mcolor;
+}
+
+bool Chess::makeMoveAssumeLegal(const Move& move, bool recordCheck) {
+    if (!validMoveObject(move)) return false;
+    int source = xy2pos(move.source_x, move.source_y);
+    int target = xy2pos(move.target_x, move.target_y);
+    if (source == target) return false;
+    Grid moved = board[source];
+    Grid captured = board[target];
+    if (moved.color != currColor || moved.type == None) return false;
+    if (captured.color == currColor) return false;
+
+    UndoRecord record;
+    record.move = move;
+    record.moved = moved;
+    record.captured = captured;
+    record.prevColor = currColor;
+    record.prevTurnId = currTurnId;
+    record.prevPeace = peaceCount;
+    record.prevKingPos[0] = kingPos[0];
+    record.prevKingPos[1] = kingPos[1];
+    record.prevHash = boardHash;
+    undoStack.push_back(record);
+
+    boardHash ^= ZOBRIST[colorIndex(moved.color)][moved.type][source];
+    if (captured.color != EMPTY && captured.type != None) {
+        boardHash ^= ZOBRIST[colorIndex(captured.color)][captured.type][target];
+    }
+
+    board[target] = moved;
+    board[source] = Grid();
+    boardHash ^= ZOBRIST[colorIndex(moved.color)][moved.type][target];
+
+    if (moved.type == King) kingPos[colorIndex(moved.color)] = target;
+    if (captured.type == King && captured.color != EMPTY) kingPos[colorIndex(captured.color)] = -1;
+
+    peaceCount = (captured.color != EMPTY) ? 0 : (peaceCount + 1);
+    bool givesCheck = recordCheck && isKingAttacked(oppColor(currColor));
+    ++currTurnId;
+    lastMoveEaten.push_back(captured.color != EMPTY ? 1 : 0);
+    lastMoveChecked.push_back(givesCheck ? 1 : 0);
+    stateKeys.push_back(boardHash);
+    currColor = oppColor(currColor);
+    return true;
+}
+
+void Chess::undoMove() {
+    if (undoStack.empty()) return;
+    UndoRecord record = undoStack.back();
+    undoStack.pop_back();
+
+    int source = xy2pos(record.move.source_x, record.move.source_y);
+    int target = xy2pos(record.move.target_x, record.move.target_y);
+    board[source] = record.moved;
+    board[target] = record.captured;
+    currColor = record.prevColor;
+    currTurnId = record.prevTurnId;
+    peaceCount = record.prevPeace;
+    kingPos[0] = record.prevKingPos[0];
+    kingPos[1] = record.prevKingPos[1];
+    boardHash = record.prevHash;
+    if (!stateKeys.empty()) stateKeys.pop_back();
+    if (!lastMoveEaten.empty()) lastMoveEaten.pop_back();
+    if (!lastMoveChecked.empty()) lastMoveChecked.pop_back();
+}
+
+bool Chess::attacked(colorType color, int mx, int my) const {
+    if (!inBoard(mx, my) || color == EMPTY) return false;
+
+    for (int dir = 0; dir < 4; ++dir) {
+        int blockers = 0;
+        int tx = mx + dx_strai[dir];
+        int ty = my + dy_strai[dir];
+        while (inBoard(tx, ty)) {
+            Grid g = getGrid(tx, ty);
+            if (g.color != EMPTY) {
+                if (blockers == 0) {
+                    if (g.color == color && g.type == Rook) return true;
+                    if (g.color == color && g.type == King && tx == mx) return true;
+                }
+                else if (blockers == 1) {
+                    if (g.color == color && g.type == Cannon) return true;
+                    break;
+                }
+                ++blockers;
+                if (blockers > 1) break;
+            }
+            tx += dx_strai[dir];
+            ty += dy_strai[dir];
+        }
+    }
+
+    for (int dir = 0; dir < 8; ++dir) {
+        int hx = mx - dx_knight[dir];
+        int hy = my - dy_knight[dir];
+        if (!inBoard(hx, hy)) continue;
+        Grid h = getGrid(hx, hy);
+        if (h.color != color || h.type != Knight) continue;
+        int fx = hx + dx_knight_foot[dir];
+        int fy = hy + dy_knight_foot[dir];
+        if (inBoard(fx, fy) && getGrid(fx, fy).color == EMPTY) return true;
+    }
+
+    int py = (color == RED) ? (my - 1) : (my + 1);
+    if (inBoard(mx, py)) {
+        Grid p = getGrid(mx, py);
+        if (p.color == color && p.type == Pawn) return true;
+    }
+    for (int side = 0; side < 2; ++side) {
+        int px = mx + dx_lr[side];
+        if (!inBoard(px, my)) continue;
+        Grid p = getGrid(px, my);
+        if (p.color == color && p.type == Pawn && crossedRiver(color, my)) return true;
+    }
+
+    if (inKingArea(mx, my, color)) {
+        for (int dir = 0; dir < 4; ++dir) {
+            int ax = mx - dx_ob[dir];
+            int ay = my - dy_ob[dir];
+            if (!inBoard(ax, ay)) continue;
+            Grid a = getGrid(ax, ay);
+            if (a.color == color && a.type == Assistant) return true;
+        }
+    }
+
+    if (inColorArea(mx, my, color)) {
+        for (int dir = 0; dir < 4; ++dir) {
+            int bx = mx - dx_bishop[dir];
+            int by = my - dy_bishop[dir];
+            int ex = bx + dx_bishop_eye[dir];
+            int ey = by + dy_bishop_eye[dir];
+            if (!inBoard(bx, by) || !inBoard(ex, ey)) continue;
+            Grid b = getGrid(bx, by);
+            if (b.color == color && b.type == Bishop && getGrid(ex, ey).color == EMPTY) return true;
+        }
+    }
+
+    return false;
+}
+
+bool Chess::isKingAttacked(colorType side) const {
+    int pos = kingPos[colorIndex(side)];
+    if (pos < 0) return true;
+    return attacked(oppColor(side), pos2x(pos), pos2y(pos));
+}
+
+bool Chess::currentKingAttacked() const {
+    return isKingAttacked(currColor);
+}
+
+void Chess::generateMoves(vector<Move>& legalMoves, bool mustDefend, bool capturesOnly) {
+    legalMoves.clear();
+    colorType side = currColor;
+    colorType enemy = oppColor(side);
+
+    auto tryAddMove = [&](int sx, int sy, int tx, int ty) {
+        if (!inBoard(tx, ty)) return;
+        Grid target = getGrid(tx, ty);
+        if (target.color == side) return;
+        if (capturesOnly && target.color != enemy) return;
+        Move move(sx, sy, tx, ty);
+        if (mustDefend) {
+            if (!makeMoveAssumeLegal(move)) return;
+            bool bad = isKingAttacked(side);
+            undoMove();
+            if (bad) return;
+        }
+        legalMoves.push_back(move);
+        };
+
+    for (int y = 0; y < BOARDHEIGHT; ++y) {
+        for (int x = 0; x < BOARDWIDTH; ++x) {
+            Grid curGrid = getGrid(x, y);
+            if (curGrid.color != side) continue;
+            switch (curGrid.type) {
+            case King: {
+                for (int dir = 0; dir < 4; ++dir) {
+                    int tx = x + dx_strai[dir];
+                    int ty = y + dy_strai[dir];
+                    if (inKingArea(tx, ty, curGrid.color)) tryAddMove(x, y, tx, ty);
+                }
+                break;
+            }
+            case Assistant: {
+                for (int dir = 0; dir < 4; ++dir) {
+                    int tx = x + dx_ob[dir];
+                    int ty = y + dy_ob[dir];
+                    if (inKingArea(tx, ty, curGrid.color)) tryAddMove(x, y, tx, ty);
+                }
+                break;
+            }
+            case Bishop: {
+                for (int dir = 0; dir < 4; ++dir) {
+                    int tx = x + dx_bishop[dir];
+                    int ty = y + dy_bishop[dir];
+                    int ex = x + dx_bishop_eye[dir];
+                    int ey = y + dy_bishop_eye[dir];
+                    if (inBoard(tx, ty) && inBoard(ex, ey) && inColorArea(tx, ty, curGrid.color) &&
+                        getGrid(ex, ey).color == EMPTY) {
+                        tryAddMove(x, y, tx, ty);
+                    }
+                }
+                break;
+            }
+            case Knight: {
+                for (int dir = 0; dir < 8; ++dir) {
+                    int tx = x + dx_knight[dir];
+                    int ty = y + dy_knight[dir];
+                    int fx = x + dx_knight_foot[dir];
+                    int fy = y + dy_knight_foot[dir];
+                    if (inBoard(tx, ty) && inBoard(fx, fy) && getGrid(fx, fy).color == EMPTY) {
+                        tryAddMove(x, y, tx, ty);
+                    }
+                }
+                break;
+            }
+            case Rook: {
+                for (int dir = 0; dir < 4; ++dir) {
+                    int tx = x + dx_strai[dir];
+                    int ty = y + dy_strai[dir];
+                    while (inBoard(tx, ty)) {
+                        Grid target = getGrid(tx, ty);
+                        if (target.color == side) break;
+                        tryAddMove(x, y, tx, ty);
+                        if (target.color == enemy) break;
+                        tx += dx_strai[dir];
+                        ty += dy_strai[dir];
+                    }
+                }
+                break;
+            }
+            case Cannon: {
+                for (int dir = 0; dir < 4; ++dir) {
+                    bool hasScreen = false;
+                    int tx = x + dx_strai[dir];
+                    int ty = y + dy_strai[dir];
+                    while (inBoard(tx, ty)) {
+                        Grid target = getGrid(tx, ty);
+                        if (!hasScreen) {
+                            if (target.color == EMPTY) {
+                                if (!capturesOnly) tryAddMove(x, y, tx, ty);
+                            }
+                            else {
+                                hasScreen = true;
+                            }
+                        }
+                        else {
+                            if (target.color != EMPTY) {
+                                if (target.color == enemy) tryAddMove(x, y, tx, ty);
+                                break;
+                            }
+                        }
+                        tx += dx_strai[dir];
+                        ty += dy_strai[dir];
+                    }
+                }
+                break;
+            }
+            case Pawn: {
+                int forward = (curGrid.color == RED) ? 1 : -1;
+                tryAddMove(x, y, x, y + forward);
+                if (crossedRiver(curGrid.color, y)) {
+                    tryAddMove(x, y, x - 1, y);
+                    tryAddMove(x, y, x + 1, y);
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+    }
+}
+
+void Chess::generateCaptureMoves(vector<Move>& legalMoves, bool mustDefend) {
+    generateMoves(legalMoves, mustDefend, true);
+}
+
+bool Chess::repeatAfterMove(const Move& move) {
+    if (!makeMoveAssumeLegal(move)) return true;
+    int idNow = currTurnId;
+    bool isCapture = !lastMoveEaten.empty() && lastMoveEaten[idNow] != 0;
+    if (isCapture) {
+        undoMove();
+        return false;
+    }
+
+    int start = idNow;
+    while (start > 1) {
+        if (lastMoveEaten[start - 2]) break;
+        start -= 2;
+    }
+
+    int repeatTimes = 0;
+    uint64_t key = stateKeys[idNow];
+    for (int id = idNow; id >= start; id -= 2) {
+        if (stateKeys[id] == key) ++repeatTimes;
+    }
+    undoMove();
+    return repeatTimes >= 3;
+}
+
+void Chess::generateMovesWithForbidden(vector<Move>& legalMoves, bool mustDefend) {
+    vector<Move> firstMoves;
+    generateMoves(firstMoves, mustDefend, false);
+    legalMoves.clear();
+    legalMoves.reserve(firstMoves.size());
+    for (size_t i = 0; i < firstMoves.size(); ++i) {
+        if (!repeatAfterMove(firstMoves[i]) && !longCheckAfterMove(firstMoves[i])) legalMoves.push_back(firstMoves[i]);
+    }
+}
+
+bool Chess::isLegalMove(const Move& move, bool mustDefend) {
+    if (!validMoveObject(move)) return false;
+    vector<Move> moves;
+    generateMoves(moves, mustDefend, false);
+    return std::find(moves.begin(), moves.end(), move) != moves.end();
+}
+
+bool Chess::isMoveValid(const Move& move, bool mustDefend) {
+    return isLegalMove(move, mustDefend);
+}
+
+bool Chess::isLegalMoveWithForbidden(const Move& move, bool mustDefend) {
+    if (!validMoveObject(move)) return false;
+    vector<Move> moves;
+    generateMovesWithForbidden(moves, mustDefend);
+    return std::find(moves.begin(), moves.end(), move) != moves.end();
+}
+
+bool Chess::isMoveValidWithForbidden(const Move& move, bool mustDefend) {
+    return isLegalMoveWithForbidden(move, mustDefend);
+}
+
+bool Chess::isMyKingAttackedAfterMove(const Move& move) {
+    colorType side = currColor;
+    if (!makeMoveAssumeLegal(move)) return true;
+    bool attackedAfter = isKingAttacked(side);
+    undoMove();
+    return attackedAfter;
+}
+
+bool Chess::isOppKingAttackedAfterMove(const Move& move) {
+    colorType enemy = oppColor(currColor);
+    if (!makeMoveAssumeLegal(move)) return false;
+    bool attackedAfter = isKingAttacked(enemy);
+    undoMove();
+    return attackedAfter;
+}
+
+bool Chess::moveGivesCheck(const Move& move) {
+    if (!makeMoveAssumeLegal(move)) return false;
+    bool givesCheck = currentKingAttacked();
+    undoMove();
+    return givesCheck;
+}
+
+int Chess::quietCheckStreakForCurrentSide() const {
+    int streak = 0;
+    for (int id = currTurnId - 1; id >= 1; id -= 2) {
+        if (id >= static_cast<int>(lastMoveEaten.size()) || id >= static_cast<int>(lastMoveChecked.size())) break;
+        if (lastMoveEaten[id] || !lastMoveChecked[id]) break;
+        ++streak;
+    }
+    return streak;
+}
+
+bool Chess::longCheckAfterMove(const Move& move) {
+    if (moveIsCapture(move)) return false;
+    if (!moveGivesCheck(move)) return false;
+    if (winAfterMove(move)) return false;
+    return quietCheckStreakForCurrentSide() >= MAX_CONSECUTIVE_QUIET_CHECKS;
+}
+
+bool Chess::winAfterMove(const Move& move) {
+    if (!makeMoveAssumeLegal(move)) return false;
+    bool win = !hasKing(currColor);
+    if (!win) {
+        vector<Move> moves;
+        generateMoves(moves, true, false);
+        win = moves.empty();
+    }
+    undoMove();
+    return win;
+}
+
+bool Chess::exceedMaxPeaceState() const {
+    return peaceCount >= PEACE_LIMIT;
+}
+
+void Chess::printBoard() const {
+    static const char sym[] = "*kbnrpca";
+    for (int y = BOARDHEIGHT - 1; y >= 0; --y) {
+        for (int x = 0; x < BOARDWIDTH; ++x) {
+            Grid g = getGrid(x, y);
+            char c = sym[g.type];
+            if (g.color == RED && c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+            std::cerr << c << ' ';
+        }
+        std::cerr << '\n';
+    }
+}
+
+namespace {
+
+    struct SearchTimeout {};
+
+    struct TTEntry {
+        uint64_t key;
+        int depth;
+        int value;
+        int flag;
+        Move bestMove;
+        TTEntry() : key(0), depth(-1), value(0), flag(TT_EXACT), bestMove() {}
+    };
+
+    class SearchEngine {
+    private:
+        static const int TT_BITS = 19;
+        static const int TT_SIZE = 1 << TT_BITS;
+        static const int TT_MASK = TT_SIZE - 1;
+
+        Chess* chess;
+        vector<TTEntry> transTable;
+        Move killer[MAX_SEARCH_PLY][2];
+        int historyScore[2][8][BOARDWIDTH * BOARDHEIGHT];
+        std::chrono::steady_clock::time_point startTime;
+        int timeLimitMs;
+        long long nodes;
+        int completedDepth;
+
+    public:
+        SearchEngine()
+            : chess(nullptr), transTable(TT_SIZE), timeLimitMs(GLOBAL_TIME_LIMIT_MS), nodes(0), completedDepth(0) {
+            std::memset(historyScore, 0, sizeof(historyScore));
+            const char* envLimit = std::getenv("BOTZONE_AI_TIME_MS");
+            if (envLimit != nullptr) {
+                int parsed = std::atoi(envLimit);
+                if (parsed >= 30 && parsed <= 10000) timeLimitMs = parsed;
+            }
+        }
+
+        Move findBestMove(Chess& board) {
+            chess = &board;
+            nodes = 0;
+            completedDepth = 0;
+            startTime = std::chrono::steady_clock::now();
+
+            vector<Move> rootMoves;
+            chess->generateMovesWithForbidden(rootMoves, true);
+            if (rootMoves.empty()) return Move();
+            orderMoves(rootMoves, Move(), 0);
+            Move bestMove = rootMoves[0];
+
+            Move bookMove = findOpeningBook(rootMoves);
+            if (validMoveObject(bookMove)) return bookMove;
+
+            int lastScore = 0;
+            for (int depth = 1; depth <= 64; ++depth) {
+                try {
+                    int alpha = -INF_SCORE;
+                    int beta = INF_SCORE;
+                    std::pair<int, Move> result;
+                    if (depth >= 4) {
+                        int delta = 120;
+                        alpha = lastScore - delta;
+                        beta = lastScore + delta;
+                        while (true) {
+                            result = searchRoot(rootMoves, depth, bestMove, alpha, beta);
+                            if (result.first <= alpha && alpha > -INF_SCORE / 2) {
+                                alpha -= delta;
+                                delta *= 2;
+                                if (delta > 2000) alpha = -INF_SCORE;
+                                continue;
+                            }
+                            if (result.first >= beta && beta < INF_SCORE / 2) {
+                                beta += delta;
+                                delta *= 2;
+                                if (delta > 2000) beta = INF_SCORE;
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    else {
+                        result = searchRoot(rootMoves, depth, bestMove, alpha, beta);
+                    }
+                    lastScore = result.first;
+                    bestMove = result.second;
+                    completedDepth = depth;
+                    if (lastScore > MATE_SCORE - 1024 || lastScore < -MATE_SCORE + 1024) break;
+                }
+                catch (const SearchTimeout&) {
+                    break;
+                }
+            }
+            return bestMove;
+        }
+
+    private:
+        Move makeCoordMove(const char* source, const char* target) const {
+            return Move(string(source), string(target));
+        }
+
+        bool containsMove(const vector<Move>& moves, const Move& candidate) const {
+            return std::find(moves.begin(), moves.end(), candidate) != moves.end();
+        }
+
+        bool hasMajorCapture(const vector<Move>& moves) const {
+            for (size_t i = 0; i < moves.size(); ++i) {
+                stoneType dst = chess->targetType(moves[i]);
+                if (dst == King || pieceValue(dst) >= pieceValue(Knight)) return true;
+            }
+            return false;
+        }
+
+        Move findOpeningBook(const vector<Move>& moves) const {
+            if (chess->currentKingAttacked()) return Move();
+            int turn = chess->currentTurn();
+            colorType side = chess->currentColor();
+            vector<Move> candidates;
+            if (turn == 0 && side == RED) {
+                candidates.push_back(makeCoordMove("h2", "e2"));
+                candidates.push_back(makeCoordMove("b2", "e2"));
+                candidates.push_back(makeCoordMove("b0", "c2"));
+                candidates.push_back(makeCoordMove("h0", "g2"));
+            }
+            else if (turn == 1 && side == BLACK) {
+                if (hasMajorCapture(moves)) return Move();
+                candidates.push_back(makeCoordMove("h7", "e7"));
+                candidates.push_back(makeCoordMove("b7", "e7"));
+                candidates.push_back(makeCoordMove("b9", "c7"));
+                candidates.push_back(makeCoordMove("h9", "g7"));
+            }
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                if (containsMove(moves, candidates[i])) return candidates[i];
+            }
+            return Move();
+        }
+
+        void checkTime() {
+            if ((nodes & 2047LL) != 0) return;
+            int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - startTime).count());
+            if (elapsed >= timeLimitMs) throw SearchTimeout();
+        }
+
+        int scoreToTT(int score, int ply) const {
+            if (score > MATE_SCORE / 2) return score + ply;
+            if (score < -MATE_SCORE / 2) return score - ply;
+            return score;
+        }
+
+        int scoreFromTT(int score, int ply) const {
+            if (score > MATE_SCORE / 2) return score - ply;
+            if (score < -MATE_SCORE / 2) return score + ply;
+            return score;
+        }
+
+        bool probeTT(uint64_t key, int depth, int alpha, int beta, int ply, int& value, Move& bestMove) {
+            const TTEntry& entry = transTable[static_cast<size_t>(key) & TT_MASK];
+            if (entry.depth < 0 || entry.key != key) return false;
+            bestMove = entry.bestMove;
+            if (entry.depth < depth) return false;
+            int ttValue = scoreFromTT(entry.value, ply);
+            if (entry.flag == TT_EXACT) {
+                value = ttValue;
+                return true;
+            }
+            if (entry.flag == TT_LOWER && ttValue >= beta) {
+                value = ttValue;
+                return true;
+            }
+            if (entry.flag == TT_UPPER && ttValue <= alpha) {
+                value = ttValue;
+                return true;
+            }
+            return false;
+        }
+
+        void storeTT(uint64_t key, int depth, int value, int flag, const Move& bestMove, int ply) {
+            TTEntry& entry = transTable[static_cast<size_t>(key) & TT_MASK];
+            if (entry.depth <= depth || entry.key != key || flag == TT_EXACT) {
+                entry.key = key;
+                entry.depth = depth;
+                entry.value = scoreToTT(value, ply);
+                entry.flag = flag;
+                entry.bestMove = bestMove;
+            }
+        }
+
+        std::pair<int, Move> searchRoot(vector<Move>& rootMoves, int depth, const Move& previousBest, int alpha, int beta) {
+            orderMoves(rootMoves, previousBest, 0);
+            int bestValue = -INF_SCORE;
+            Move bestMove = rootMoves[0];
+            bool firstMove = true;
+
+            for (size_t i = 0; i < rootMoves.size(); ++i) {
+                checkTime();
+                const Move& move = rootMoves[i];
+                int score;
+                chess->makeMoveAssumeLegal(move);
+                if (firstMove) {
+                    score = -negamax(depth - 1, -beta, -alpha, 1);
+                }
+                else {
+                    score = -negamax(depth - 1, -alpha - 1, -alpha, 1);
+                    if (score > alpha && score < beta) {
+                        score = -negamax(depth - 1, -beta, -alpha, 1);
+                    }
+                }
+                chess->undoMove();
+                firstMove = false;
+
+                if (score > bestValue) {
+                    bestValue = score;
+                    bestMove = move;
+                }
+                if (score > alpha) alpha = score;
+                if (alpha >= beta) break;
+            }
+            return std::make_pair(bestValue, bestMove);
+        }
+
+        int negamax(int depth, int alpha, int beta, int ply) {
+            ++nodes;
+            checkTime();
+
+            if (!chess->hasKing(chess->currentColor())) return -MATE_SCORE + ply;
+            if (!chess->hasKing(Chess::oppColor(chess->currentColor()))) return MATE_SCORE - ply;
+            if (chess->exceedMaxPeaceState()) return 0;
+            if (ply >= MAX_SEARCH_PLY - 2) return evaluate();
+
+            bool inCheck = chess->currentKingAttacked();
+            if (depth <= 0 && !inCheck) return quiescence(alpha, beta, ply, 0);
+            if (depth <= 0 && inCheck) depth = 1;
+
+            int alphaOriginal = alpha;
+            uint64_t key = chess->searchKey();
+            Move hashMove;
+            int ttValue = 0;
+            if (probeTT(key, depth, alpha, beta, ply, ttValue, hashMove)) return ttValue;
+
+            vector<Move> moves;
+            chess->generateMoves(moves, true, false);
+            if (moves.empty()) return -MATE_SCORE + ply;
+            orderMoves(moves, hashMove, ply);
+
+            int bestValue = -INF_SCORE;
+            Move bestMove = moves[0];
+            int moveIndex = 0;
+
+            for (size_t i = 0; i < moves.size(); ++i) {
+                const Move& move = moves[i];
+                bool capture = chess->moveIsCapture(move);
+                chess->makeMoveAssumeLegal(move);
+                bool givesCheck = chess->currentKingAttacked();
+                int nextDepth = depth - 1;
+                if (givesCheck && nextDepth <= 2) ++nextDepth;
+
+                int score;
+                if (moveIndex == 0) {
+                    score = -negamax(nextDepth, -beta, -alpha, ply + 1);
+                }
+                else {
+                    int reduction = 0;
+                    if (depth >= 3 && moveIndex >= 4 && !capture && !inCheck && !givesCheck) {
+                        reduction = 1;
+                        if (depth >= 5 && moveIndex >= 10) reduction = 2;
+                    }
+                    int reducedDepth = nextDepth - reduction;
+                    if (reducedDepth < 0) reducedDepth = 0;
+                    score = -negamax(reducedDepth, -alpha - 1, -alpha, ply + 1);
+                    if (reduction > 0 && score > alpha) {
+                        score = -negamax(nextDepth, -alpha - 1, -alpha, ply + 1);
+                    }
+                    if (score > alpha && score < beta) {
+                        score = -negamax(nextDepth, -beta, -alpha, ply + 1);
+                    }
+                }
+                chess->undoMove();
+                ++moveIndex;
+
+                if (score > bestValue) {
+                    bestValue = score;
+                    bestMove = move;
+                }
+                if (score > alpha) alpha = score;
+                if (alpha >= beta) {
+                    if (!capture) {
+                        saveKiller(ply, move);
+                        updateHistory(move, depth, chess->currentColor());
+                    }
+                    storeTT(key, depth, alpha, TT_LOWER, bestMove, ply);
+                    return alpha;
+                }
+            }
+
+            int flag = TT_EXACT;
+            if (bestValue <= alphaOriginal) flag = TT_UPPER;
+            else if (bestValue >= beta) flag = TT_LOWER;
+            storeTT(key, depth, bestValue, flag, bestMove, ply);
+            return bestValue;
+        }
+
+        int quiescence(int alpha, int beta, int ply, int qply) {
+            ++nodes;
+            checkTime();
+            if (!chess->hasKing(chess->currentColor())) return -MATE_SCORE + ply;
+            if (!chess->hasKing(Chess::oppColor(chess->currentColor()))) return MATE_SCORE - ply;
+            if (chess->exceedMaxPeaceState()) return 0;
+            if (ply >= MAX_SEARCH_PLY - 2) return evaluate();
+
+            bool inCheck = chess->currentKingAttacked();
+            int standPat = -INF_SCORE;
+            if (!inCheck) {
+                standPat = evaluate();
+                if (standPat >= beta) return beta;
+                if (standPat > alpha) alpha = standPat;
+                if (qply >= 8) return alpha;
+            }
+
+            vector<Move> moves;
+            if (inCheck) chess->generateMoves(moves, true, false);
+            else chess->generateCaptureMoves(moves, true);
+            if (moves.empty()) return inCheck ? (-MATE_SCORE + ply) : alpha;
+            orderMoves(moves, Move(), ply);
+
+            for (size_t i = 0; i < moves.size(); ++i) {
+                const Move& move = moves[i];
+                if (!inCheck && standPat != -INF_SCORE) {
+                    stoneType capturedType = chess->targetType(move);
+                    int capturedValue = pieceValue(capturedType);
+                    if (capturedType != King && standPat + capturedValue + 180 < alpha) continue;
+                }
+                chess->makeMoveAssumeLegal(move);
+                int score = -quiescence(-beta, -alpha, ply + 1, qply + 1);
+                chess->undoMove();
+                if (score >= beta) return beta;
+                if (score > alpha) alpha = score;
+            }
+            return alpha;
+        }
+
+        void saveKiller(int ply, const Move& move) {
+            if (ply < 0 || ply >= MAX_SEARCH_PLY) return;
+            if (killer[ply][0] != move) {
+                killer[ply][1] = killer[ply][0];
+                killer[ply][0] = move;
+            }
+        }
+
+        void updateHistory(const Move& move, int depth, colorType side) {
+            stoneType type = chess->sourceType(move);
+            if (type == None) return;
+            int& cell = historyScore[colorIndex(side)][type][Chess::xy2pos(move.target_x, move.target_y)];
+            cell += depth * depth * 32;
+            if (cell > 10000000) {
+                for (int c = 0; c < 2; ++c)
+                    for (int t = 0; t < 8; ++t)
+                        for (int p = 0; p < BOARDWIDTH * BOARDHEIGHT; ++p)
+                            historyScore[c][t][p] /= 2;
+            }
+        }
+
+        void orderMoves(vector<Move>& moves, const Move& hashMove, int ply) {
+            struct ScoredMove {
+                Move move;
+                int score;
+            };
+            vector<ScoredMove> scored;
+            scored.reserve(moves.size());
+            colorType mover = chess->currentColor();
+            for (size_t i = 0; i < moves.size(); ++i) {
+                const Move& move = moves[i];
+                stoneType src = chess->sourceType(move);
+                stoneType dst = chess->targetType(move);
+                int score = 0;
+                if (validMoveObject(hashMove) && move == hashMove) score += 100000000;
+                if (dst != None) {
+                    score += 10000000 + pieceValue(dst) * 24 - pieceValue(src);
+                    if (dst == King) score += 50000000;
+                }
+                else {
+                    if (ply >= 0 && ply < MAX_SEARCH_PLY) {
+                        if (move == killer[ply][0]) score += 9000000;
+                        else if (move == killer[ply][1]) score += 8500000;
+                    }
+                    if (src != None) score += historyScore[colorIndex(mover)][src][Chess::xy2pos(move.target_x, move.target_y)];
+                }
+                int targetCenter = centerScore(move.target_x);
+                if (src == Pawn) score += relativeY(mover, move.target_y) * 12 + targetCenter * 5;
+                else if (src == Knight || src == Cannon) score += targetCenter * 8;
+                else if (src == Rook) score += targetCenter * 3;
+                scored.push_back(ScoredMove{ move, score });
+            }
+            std::sort(scored.begin(), scored.end(), [](const ScoredMove& a, const ScoredMove& b) {
+                return a.score > b.score;
+                });
+            for (size_t i = 0; i < scored.size(); ++i) moves[i] = scored[i].move;
+        }
+
+        int mobilityAt(int x, int y, const Grid& grid) const {
+            int mobility = 0;
+            switch (grid.type) {
+            case King: {
+                for (int dir = 0; dir < 4; ++dir) {
+                    int tx = x + dx_strai[dir], ty = y + dy_strai[dir];
+                    if (Chess::inKingArea(tx, ty, grid.color)) {
+                        Grid t = chess->getGrid(tx, ty);
+                        if (t.color != grid.color) ++mobility;
+                    }
+                }
+                break;
+            }
+            case Assistant: {
+                for (int dir = 0; dir < 4; ++dir) {
+                    int tx = x + dx_ob[dir], ty = y + dy_ob[dir];
+                    if (Chess::inKingArea(tx, ty, grid.color)) {
+                        Grid t = chess->getGrid(tx, ty);
+                        if (t.color != grid.color) ++mobility;
+                    }
+                }
+                break;
+            }
+            case Bishop: {
+                for (int dir = 0; dir < 4; ++dir) {
+                    int tx = x + dx_bishop[dir], ty = y + dy_bishop[dir];
+                    int ex = x + dx_bishop_eye[dir], ey = y + dy_bishop_eye[dir];
+                    if (Chess::inBoard(tx, ty) && Chess::inBoard(ex, ey) && Chess::inColorArea(tx, ty, grid.color) &&
+                        chess->getGrid(ex, ey).color == EMPTY) {
+                        Grid t = chess->getGrid(tx, ty);
+                        if (t.color != grid.color) ++mobility;
+                    }
+                }
+                break;
+            }
+            case Knight: {
+                for (int dir = 0; dir < 8; ++dir) {
+                    int tx = x + dx_knight[dir], ty = y + dy_knight[dir];
+                    int fx = x + dx_knight_foot[dir], fy = y + dy_knight_foot[dir];
+                    if (Chess::inBoard(tx, ty) && Chess::inBoard(fx, fy) && chess->getGrid(fx, fy).color == EMPTY) {
+                        Grid t = chess->getGrid(tx, ty);
+                        if (t.color != grid.color) ++mobility;
+                    }
+                }
+                break;
+            }
+            case Rook: {
+                for (int dir = 0; dir < 4; ++dir) {
+                    int tx = x + dx_strai[dir], ty = y + dy_strai[dir];
+                    while (Chess::inBoard(tx, ty)) {
+                        Grid t = chess->getGrid(tx, ty);
+                        if (t.color == grid.color) break;
+                        mobility += (t.color == EMPTY ? 1 : 2);
+                        if (t.color != EMPTY) break;
+                        tx += dx_strai[dir];
+                        ty += dy_strai[dir];
+                    }
+                }
+                break;
+            }
+            case Cannon: {
+                for (int dir = 0; dir < 4; ++dir) {
+                    bool screen = false;
+                    int tx = x + dx_strai[dir], ty = y + dy_strai[dir];
+                    while (Chess::inBoard(tx, ty)) {
+                        Grid t = chess->getGrid(tx, ty);
+                        if (!screen) {
+                            if (t.color == EMPTY) ++mobility;
+                            else screen = true;
+                        }
+                        else if (t.color != EMPTY) {
+                            if (t.color != grid.color) mobility += 2;
+                            break;
+                        }
+                        tx += dx_strai[dir];
+                        ty += dy_strai[dir];
+                    }
+                }
+                break;
+            }
+            case Pawn: {
+                int forward = grid.color == RED ? 1 : -1;
+                int tx = x, ty = y + forward;
+                if (Chess::inBoard(tx, ty) && chess->getGrid(tx, ty).color != grid.color) ++mobility;
+                if (crossedRiver(grid.color, y)) {
+                    for (int dir = 0; dir < 2; ++dir) {
+                        tx = x + dx_lr[dir];
+                        ty = y;
+                        if (Chess::inBoard(tx, ty) && chess->getGrid(tx, ty).color != grid.color) ++mobility;
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+            }
+            return mobility;
+        }
+
+        int blockedKnightFeet(int x, int y) const {
+            static const int fx[4] = { -1, 1, 0, 0 };
+            static const int fy[4] = { 0, 0, -1, 1 };
+            int blocked = 0;
+            for (int i = 0; i < 4; ++i) {
+                int tx = x + fx[i], ty = y + fy[i];
+                if (Chess::inBoard(tx, ty) && chess->getGrid(tx, ty).color != EMPTY) ++blocked;
+            }
+            return blocked;
+        }
+
+        bool findKing(colorType color, int& kx, int& ky) const {
+            for (int y = 0; y < BOARDHEIGHT; ++y) {
+                for (int x = 0; x < BOARDWIDTH; ++x) {
+                    Grid grid = chess->getGrid(x, y);
+                    if (grid.color == color && grid.type == King) {
+                        kx = x;
+                        ky = y;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        int filePressurePenalty(colorType side, int kx, int ky) const {
+            int penalty = 0;
+            colorType enemy = oppositeColor(side);
+            for (int sign = -1; sign <= 1; sign += 2) {
+                int blockers = 0;
+                int y = ky + sign;
+                while (Chess::inBoard(kx, y)) {
+                    Grid grid = chess->getGrid(kx, y);
+                    if (grid.color != EMPTY) {
+                        if (grid.color == enemy) {
+                            if (blockers == 0 && (grid.type == Rook || grid.type == King)) penalty += (grid.type == King ? 140 : 100);
+                            else if (blockers == 1 && grid.type == Cannon) penalty += 85;
+                            break;
+                        }
+                        ++blockers;
+                        if (blockers > 1) break;
+                    }
+                    y += sign;
+                }
+            }
+            return penalty;
+        }
+
+        int sideEvaluation(colorType side) const {
+            int score = 0;
+            int advisors = 0, bishops = 0, rooks = 0, cannons = 0, knights = 0, pawns = 0;
+            int kx = -1, ky = -1;
+
+            for (int y = 0; y < BOARDHEIGHT; ++y) {
+                for (int x = 0; x < BOARDWIDTH; ++x) {
+                    Grid grid = chess->getGrid(x, y);
+                    if (grid.color != side) continue;
+                    int rel = relativeY(side, y);
+                    int cen = centerScore(x);
+                    int mobility = mobilityAt(x, y, grid);
+                    score += pieceValue(grid.type);
+
+                    switch (grid.type) {
+                    case King:
+                        kx = x;
+                        ky = y;
+                        score += cen * 3;
+                        if (x != 4) score -= 10;
+                        break;
+                    case Rook:
+                        ++rooks;
+                        score += mobility * 6 + cen * 4 + rel * 2;
+                        if (rel >= 5) score += 15;
+                        break;
+                    case Knight:
+                        ++knights;
+                        score += mobility * 8 + cen * 10 + rel * 4 - blockedKnightFeet(x, y) * 18;
+                        if (rel >= 4 && cen >= 2) score += 12;
+                        break;
+                    case Cannon:
+                        ++cannons;
+                        score += mobility * 5 + cen * 8 + (rel >= 4 ? 16 : 0);
+                        if (y == (side == RED ? 2 : 7) && (x == 1 || x == 7)) score += 6;
+                        break;
+                    case Pawn:
+                        ++pawns;
+                        score += rel * 18 + cen * 5;
+                        if (rel >= 5) score += 76 + cen * 13;
+                        if (rel >= 7) score += 35;
+                        if (x == 4 && rel >= 5) score += 24;
+                        break;
+                    case Assistant:
+                        ++advisors;
+                        score += 8 + (Chess::inKingArea(x, y, side) ? 12 : 0);
+                        if (x == 4 && (y == (side == RED ? 1 : 8))) score += 6;
+                        break;
+                    case Bishop:
+                        ++bishops;
+                        score += 8 + (rel <= 4 ? 10 : 0);
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
+
+            score += advisors * 20 + bishops * 16;
+            if (advisors < 2) score -= (2 - advisors) * 38;
+            if (bishops < 2) score -= (2 - bishops) * 30;
+            if (rooks == 0) score -= 65;
+            if (rooks >= 1 && cannons + knights >= 2) score += 25;
+            if (cannons == 2 && knights == 0) score -= 20;
+            if (knights == 2 && cannons == 0) score += 10;
+            if (pawns == 0) score -= 25;
+
+            if (kx >= 0) {
+                score -= filePressurePenalty(side, kx, ky);
+                int homeY = side == RED ? 0 : 9;
+                if (std::abs(ky - homeY) >= 2 && advisors + bishops <= 2) score -= 40;
+            }
+            return score;
+        }
+
+        int evaluate() {
+            int redScore = sideEvaluation(RED);
+            int blackScore = sideEvaluation(BLACK);
+            int value = redScore - blackScore;
+            if (chess->currentColor() == BLACK) value = -value;
+            value += 12;
+            if (chess->currentKingAttacked()) value -= 75;
+            return value;
+        }
+    };
+
+} // namespace
+
+void getInputBotzone(Chess& chess);
+void giveOutputBotzone(Chess& chess);
+
+int main() {
+    Chess chess;
+    getInputBotzone(chess);
+    giveOutputBotzone(chess);
+    return 0;
+}
+
+namespace {
+
+    int parseTimeLimitMs(const Json::Value& input) {
+        if (!input.isMember("time_limit")) return DEFAULT_TIME_MS;
+        const Json::Value& v = input["time_limit"];
+        int raw = 0;
+        if (v.isInt()) raw = v.asInt();
+        else if (v.isUInt()) raw = static_cast<int>(v.asUInt());
+        else if (v.isString()) raw = std::atoi(v.asString().c_str());
+        if (raw <= 0) return DEFAULT_TIME_MS;
+        int budget = raw;
+        if (budget >= 100) budget = std::min(budget - 70, budget * 80 / 100);
+        else budget = std::max(30, budget - 10);
+        return clampInt(budget, 30, 5000);
+    }
+
+    bool isPassMoveString(const string& source) {
+        return source == "-1";
+    }
+
+    void applyJsonMove(Chess& chess, const Json::Value& obj) {
+        if (!obj.isObject()) return;
+        string source = obj["source"].asString();
+        string target = obj["target"].asString();
+        if (isPassMoveString(source)) return;
+        Move move(source, target);
+        if (validMoveObject(move)) chess.makeMoveAssumeLegal(move, true);
+    }
+
+} // namespace
+
+void getInputBotzone(Chess& chess) {
+    string str;
+    if (!std::getline(cin, str)) return;
+    Json::Reader reader;
+    Json::Value input;
+    if (!reader.parse(str, input)) return;
+    GLOBAL_TIME_LIMIT_MS = parseTimeLimitMs(input);
+
+    int turnID = 0;
+    if (input.isMember("responses") && input["responses"].isArray()) {
+        turnID = static_cast<int>(input["responses"].size());
+    }
+
+    for (int i = 0; i < turnID; ++i) {
+        if (input.isMember("requests") && input["requests"].isArray() && i < static_cast<int>(input["requests"].size())) {
+            applyJsonMove(chess, input["requests"][i]);
+        }
+        applyJsonMove(chess, input["responses"][i]);
+    }
+
+    if (input.isMember("requests") && input["requests"].isArray() && turnID < static_cast<int>(input["requests"].size())) {
+        applyJsonMove(chess, input["requests"][turnID]);
+    }
+}
+
+void giveOutputBotzone(Chess& chess) {
+    vector<Move> retMoves;
+    chess.generateMovesWithForbidden(retMoves, true);
+    Json::Value ret;
+
+    if (retMoves.empty()) {
+        ret["response"]["source"] = string("-1");
+        ret["response"]["target"] = string("-1");
+    }
+    else {
+        SearchEngine engine;
+        Move selMove = engine.findBestMove(chess);
+        if (!validMoveObject(selMove) || std::find(retMoves.begin(), retMoves.end(), selMove) == retMoves.end()) {
+            selMove = retMoves[0];
+        }
+        ret["response"]["source"] = string(1, pgnint2char(selMove.source_x)) + string(1, int2char(selMove.source_y));
+        ret["response"]["target"] = string(1, pgnint2char(selMove.target_x)) + string(1, int2char(selMove.target_y));
+    }
+
+    Json::FastWriter writer;
+    cout << writer.write(ret) << std::endl;
+}
